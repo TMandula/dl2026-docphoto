@@ -58,7 +58,12 @@ def to_tensor(a, device: str) -> torch.Tensor:
 
 def make_optimizer(model: torch.nn.Module, cfg: dict) -> torch.optim.Optimizer:
     """TASK 3. The optimiser, using cfg['train']['lr'] and cfg['train']['weight_decay']."""
-    raise NotImplementedError("TASK 3: choose the optimiser")
+    tr = cfg["train"]
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=tr["lr"],
+        weight_decay=tr["weight_decay"]
+    )
 
 
 def train_epoch(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss_fn: torch.nn.Module,
@@ -69,7 +74,33 @@ def train_epoch(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss_f
     run is reproducible, step the optimiser once per minibatch, and return the
     mean training loss over the epoch, weighted by minibatch size.
     """
-    raise NotImplementedError("TASK 4: the minibatch loop")
+    # Training mode (enables dropout)
+    model.train()  
+    total_loss = 0.0
+    n_samples = len(X)
+    
+    # Generating mixed indices for reproducibility
+    indices = torch.randperm(n_samples, generator=generator)
+    
+    for i in range(0, n_samples, batch_size):
+        batch_idx = indices[i:i + batch_size]
+        xb = X[batch_idx]
+        yb = y[batch_idx]
+        
+        # 1. Forecast
+        preds = model(xb)
+        # 2. Calculation of error
+        loss = loss_fn(preds, yb)
+        
+        # 3. Optimization steps
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # Collecting weighted errors
+        total_loss += loss.item() * len(batch_idx)
+        
+    return total_loss / n_samples
 
 
 def predict(model: torch.nn.Module, X: torch.Tensor, batch_size: int = 1024) -> np.ndarray:
@@ -78,12 +109,23 @@ def predict(model: torch.nn.Module, X: torch.Tensor, batch_size: int = 1024) -> 
     Evaluation mode, no gradients, and it must give the same answer for a row
     whether that row is predicted alone or inside a batch.
     """
-    raise NotImplementedError("TASK 5: inference")
+    # Evaluation mode (disables dropout)
+    model.eval()  
+    preds_list = []
+    
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            xb = X[i:i + batch_size]
+            out = model(xb)
+            preds_list.append(out.cpu().numpy())
+            
+    return np.concatenate(preds_list)
 
 
 def validate(model: torch.nn.Module, X_val: torch.Tensor, y_val: np.ndarray, ok: np.ndarray) -> float:
     """TASK 6. RMSE on the validation rows where `ok` is True (the scoreable ones)."""
-    raise NotImplementedError("TASK 6: validation")
+    preds = predict(model, X_val)
+    return float(rmse(y_val[ok], preds[ok]))
 
 
 # ------------------------------------------------------------------ given

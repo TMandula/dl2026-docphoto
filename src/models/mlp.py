@@ -25,7 +25,38 @@ import torch.nn as nn
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden: list[int], dropout: float = 0.3, prior: float = 0.5):
         super().__init__()
-        raise NotImplementedError("TASK 2: build the layers")
+        # 1. Building hidden layers (Linear + nonlinearity + Dropout)
+        layers = []
+        current_dim = in_dim
+        for h_dim in hidden:
+            layers.append(nn.Linear(current_dim, h_dim))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            current_dim = h_dim
+            
+        self.hidden_layers = nn.Sequential(*layers)
+        
+        # 2. Final output layer (for 1 dimension)
+        self.output_layer = nn.Linear(current_dim, 1)
+        
+        # 3. Setting the output bias to the prior logit value,
+        # so that the untrained network yields the correct average approximation right from the start.
+        with torch.no_grad():
+            # Safety guard to avoid division by zero or one
+            p = max(min(prior, 0.999), 0.001)
+            bias_val = torch.log(torch.tensor(p / (1 - p)))
+            self.output_layer.bias.fill_(bias_val)
+            
+        # 4. Sigmoid activation constraining the output to the [0, 1] range
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("TASK 2: one number in [0, 1] per row, shape (batch,)")
+        # Execution on the hidden layers
+        out = self.hidden_layers(x)
+        # Output layer
+        out = self.output_layer(out)
+        # Mapping value to [0, 1]
+        out = self.sigmoid(out)
+        # Adjusting the output size from (batch, 1) to (batch,)
+        return out.squeeze(-1)
