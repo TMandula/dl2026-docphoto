@@ -293,3 +293,6 @@ third of the photographs, on a 1 to 5 scale, from several raters each. The
 competition does not score them. Where people and the OCR engine disagree, and
 whether the disagreement is structured, is an open question on data you helped
 create.
+
+## Lab 3 Results
+- MLP validation RMSE (with early stopping): 0.2358

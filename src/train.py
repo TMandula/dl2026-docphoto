@@ -142,12 +142,26 @@ def train_mlp(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray,
     set_seed(cfg["seed"])
     tr = cfg["train"]
 
-    scaler = Standardiser().fit(X[train_idx])
-    X_tr = to_tensor(scaler.transform(X[train_idx]), device)
-    X_va = to_tensor(scaler.transform(X[val_idx]), device)
-    y_tr = to_tensor(df[config.TARGET].to_numpy()[train_idx], device)
+    # HF1. Internal split within `train_idx` for early stopping (e.g., using the last training group for internal validation)
+    # Assuming we form an internal basis from the rows belonging to `train_idx`:
+    train_groups = df.iloc[train_idx]["group_strict"].unique()
+    # Set aside the last training group for internal validation purposes (early stopping validation).
+    es_group = train_groups[-1] if len(train_groups) > 1 else train_groups[0]
+    
+    inner_train_mask = train_idx[~df.iloc[train_idx]["group_strict"].eq(es_group)]
+    inner_val_mask = train_idx[df.iloc[train_idx]["group_strict"].eq(es_group)]
+
+    scaler = Standardiser().fit(X[inner_train_mask])
+    X_tr = to_tensor(scaler.transform(X[inner_train_mask]), device)
+    X_es = to_tensor(scaler.transform(X[inner_val_mask]), device)  # Early stopping with internal val
+    X_va = to_tensor(scaler.transform(X[val_idx]), device)         # Completely untouched exterior    
+    
+    y_tr = to_tensor(df[config.TARGET].to_numpy()[inner_train_mask], device)
+    y_es = df[config.TARGET].to_numpy()[inner_val_mask]
+    ok_es = df["eval_ok"].to_numpy()[inner_val_mask] == 1
+    
     y_va = df[config.TARGET].to_numpy()[val_idx]
-    ok = df["eval_ok"].to_numpy()[val_idx] == 1
+    ok_va = df["eval_ok"].to_numpy()[val_idx] == 1
 
     model = MLP(in_dim=X.shape[1], hidden=list(cfg["model"]["hidden"]), dropout=cfg["model"]["dropout"],
                 prior=float(y_tr.mean())).to(device)
@@ -157,32 +171,68 @@ def train_mlp(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray,
 
     tracking.init_run(cfg, tags=tags)
     history, snapshots = [], {}
+
+    best_es_rmse = float("inf")
+    best_state_dict = None
+    best_epoch = 1
+
     log(f"{cfg['name']}: {len(train_idx)} train / {len(val_idx)} val rows, {X.shape[1]} inputs, "
         f"{sum(p.numel() for p in model.parameters()):,} parameters, {device}")
+
     for epoch in range(1, tr["epochs"] + 1):
         t0 = time.time()
         loss = train_epoch(model, optimizer, loss_fn, X_tr, y_tr, tr["batch_size"], generator)
-        val = validate(model, X_va, y_va, ok)
+        
+        # Internal validation error for early stopping
+        es_val_rmse = validate(model, X_es, y_es, ok_es)
+        # External validation error (for monitoring/logging purposes only; decisions are not based on this)
+        outer_val_rmse = validate(model, X_va, y_va, ok_va)
+        
         train_eval = rmse(y_tr.cpu().numpy(), predict(model, X_tr))   # dropout off, as in validation
-        row = {"epoch": epoch, "train_loss": loss, "train_rmse": train_eval, "val_rmse": val,
-               "seconds": time.time() - t0}
+
+        # We find and store the best model based on internal validation
+        if es_val_rmse < best_es_rmse:
+            best_es_rmse = es_val_rmse
+            best_epoch = epoch
+            import copy
+            best_state_dict = copy.deepcopy(model.state_dict())
+
+        row = {"epoch": epoch, "train_loss": loss, "train_rmse": train_eval, "val_rmse": outer_val_rmse, 
+               "es_val_rmse": es_val_rmse, "seconds": time.time() - t0}
         history.append(row)
-        tracking.log_metrics({"train_loss": loss, "train_rmse": train_eval, "val_rmse": val}, step=epoch)
+        tracking.log_metrics({"train_loss": loss, "train_rmse": train_eval, "val_rmse": outer_val_rmse, 
+                              "es_val_rmse": es_val_rmse}, step=epoch)
+
         if epoch in (1, tr["epochs"]) or epoch % tr.get("log_every", 10) == 0:
-            log(f"epoch {epoch:3d}  train loss {loss:.4f}  train RMSE {train_eval:.4f}  val RMSE {val:.4f}")
+            log(f"epoch {epoch:3d} train loss {loss:.4f} ES val RMSE {es_val_rmse:.4f} outer val RMSE {outer_val_rmse:.4f}")
+
         if epoch in (1, tr["epochs"]):
             snapshots[epoch] = predict(model, X_va)
+
+    # 2. We reload the weights from the epoch that performed best during internal validation!
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+    log(f"Early stopping: using best model from epoch {best_epoch} (ES val RMSE: {best_es_rmse:.4f})")
+
+    # 3. Final prediction and evaluation on the completely untouched external validation set.
+    final_outer_val_rmse = validate(model, X_va, y_va, ok_va)
+    
+    if 1 not in snapshots:
+        pass
+    snapshots[tr["epochs"]] = predict(model, X_va)
 
     ckpt = config.ROOT / "models" / f"{cfg['name']}.pt"
     ckpt.parent.mkdir(exist_ok=True)
     torch.save({"state_dict": model.state_dict(), "config": cfg, "in_dim": X.shape[1],
                 "scaler_mean": scaler.mean, "scaler_scale": scaler.scale}, ckpt)
-    tracking.log_checkpoint(ckpt, cfg["name"], {"val_rmse": history[-1]["val_rmse"]})
-    tracking.log_metrics({"final_val_rmse": history[-1]["val_rmse"]})
+
+    tracking.log_checkpoint(ckpt, cfg["name"], {"val_rmse": final_outer_val_rmse})
+    tracking.log_metrics({"final_val_rmse": final_outer_val_rmse})
+
     url = tracking.run_url()
     tracking.finish()
-    return {"history": pd.DataFrame(history), "val_pred": snapshots[tr["epochs"]], "snapshots": snapshots,
-            "model": model, "checkpoint": ckpt, "url": url, "val_index": val_idx, "ok": ok}
+    return {"history": pd.DataFrame(history), "val_pred": predict(model, X_va), "snapshots": snapshots,
+            "model": model, "checkpoint": ckpt, "url": url, "val_index": val_idx, "ok": ok_va}
 
 
 def main() -> None:

@@ -44,6 +44,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import torch
+import numpy as np
+from src.models.mlp import MLP
+from src.data.dataset import pixels_of_image
 import pandas as pd
 import yaml
 
@@ -54,7 +58,32 @@ def load_model(checkpoint: Path, cfg: dict):
     Put the model in eval mode and disable gradients. Return something callable
     that maps one preprocessed image to one float.
     """
-    raise NotImplementedError("TODO: build the model and load the checkpoint")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # 1. We load the saved .pt file (which contains the state_dict and the scaler).
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    
+    # 2. We are rebuilding the MLP architecture.
+    model = MLP(
+        in_dim=ckpt["in_dim"], 
+        hidden=list(cfg["model"]["hidden"]), 
+        dropout=cfg["model"]["dropout"],
+        prior=0.5  # A state_dict úgyis felülírja a kimeneti biast
+    )
+    
+    # 3. We load the weights and set it to eval mode.
+    model.load_state_dict(ckpt["state_dict"])
+    model.to(device)
+    model.eval()
+    model.requires_grad_(False)
+    
+    # 4. We attach the scaler parameters and the device to the model 
+    # so that `predict_one` can use them later.
+    model.scaler_mean = ckpt["scaler_mean"]
+    model.scaler_scale = ckpt["scaler_scale"]
+    model.device = device
+    
+    return model
 
 
 def preprocess(image_path: Path, cfg: dict):
@@ -64,13 +93,32 @@ def preprocess(image_path: Path, cfg: dict):
     between training and prediction is the single most common reason a good
     validation score turns into a bad leaderboard score.
     """
-    raise NotImplementedError("TODO: load and preprocess a single image")
+    # We read the image and convert it into raw pixels (1D NumPy array).
+    pixel_size = cfg["data"]["pixel_size"]
+    pixels = pixels_of_image(image_path, pixel_size)
+    
+    return pixels
 
 
 def predict_one(model, image_path: Path, cfg: dict) -> float:
     """One image in, one number out."""
-    raise NotImplementedError("TODO: run the model, return a float in [0, 1]")
+    # 1. Extracting raw pixels
+    pixels = preprocess(image_path, cfg)
+    
+    # 2. Standardization based on the mean and scale saved during training.
+    pixels_scaled = (pixels - model.scaler_mean) / model.scaler_scale
+    
+    # 3. Conversion to a tensor and addition of a batch dimension (1, N)
+    x = torch.tensor(pixels_scaled, dtype=torch.float32, device=model.device).unsqueeze(0)
+    
+    # 4. Run prediction
+    with torch.no_grad():
+        prediction = model(x)
 
+    # We extract the float with .item() and clip it to [0, 1].
+    val = prediction.item()
+    return max(0.0, min(1.0, val))
+    
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Write a Kaggle submission file")
